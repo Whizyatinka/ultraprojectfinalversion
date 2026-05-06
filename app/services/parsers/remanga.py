@@ -1,9 +1,11 @@
 import asyncio
+import base64
 import logging
 from dataclasses import dataclass
 from typing import Optional
 
 import aiohttp
+import cloudscraper
 from bs4 import BeautifulSoup
 from app.config import config
 
@@ -50,7 +52,16 @@ class RemangaParser:
             "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
             "Accept": "application/json",
         }
-        logger.info("RemangaParser initialized with FlareSolverr support")
+        
+        # Инициализируем cloudscraper для обхода Cloudflare
+        self.scraper = cloudscraper.create_scraper(
+            browser={
+                'browser': 'chrome',
+                'platform': 'windows',
+                'mobile': False
+            }
+        )
+        logger.info("RemangaParser initialized with cloudscraper support")
     
     async def _get_session(self):
         if self.session is None or self.session.closed:
@@ -87,7 +98,6 @@ class RemangaParser:
                     raise Exception(f"FlareSolverr failed: {result.get('message')}")
                 
                 # FlareSolverr возвращает base64 encoded content для бинарных данных
-                import base64
                 solution = result.get("solution", {})
                 response_text = solution.get("response")
                 
@@ -104,6 +114,41 @@ class RemangaParser:
             logger.error(f"FlareSolverr error: {e}")
             raise
     
+    def _calculate_relevance(self, query: str, title: str) -> float:
+        """Вычисляет релевантность названия манги к поисковому запросу"""
+        query_lower = query.lower().strip()
+        title_lower = title.lower().strip()
+        
+        # Точное совпадение - максимальный приоритет
+        if query_lower == title_lower:
+            return 100.0
+        
+        # Название начинается с запроса
+        if title_lower.startswith(query_lower):
+            return 90.0
+        
+        # Запрос содержится в начале названия (после пробела/знака)
+        if f" {query_lower}" in title_lower or f"-{query_lower}" in title_lower:
+            return 80.0
+        
+        # Запрос содержится где-то в названии
+        if query_lower in title_lower:
+            return 70.0
+        
+        # Проверка по словам (все слова запроса есть в названии)
+        query_words = query_lower.split()
+        title_words = title_lower.split()
+        
+        if len(query_words) > 1:
+            matches = sum(1 for qw in query_words if any(qw in tw for tw in title_words))
+            if matches == len(query_words):
+                return 60.0
+            elif matches > 0:
+                return 40.0 + (matches / len(query_words)) * 10
+        
+        # Низкая релевантность
+        return 0.0
+
     async def search(self, query: str, limit: int = 10) -> list[MangaTitleInfo]:
         url = f"{self.API_URL}/search/"
         params = {"query": query}
@@ -121,26 +166,51 @@ class RemangaParser:
                 
                 data = await response.json()
                 logger.info(f"Response data keys: {data.keys()}")
-                results = []
+                results_with_score = []
                 
                 items = data.get("content", [])
                 logger.info(f"Number of items in data: {len(items)}")
                 
-                for item in items[:limit]:
+                for item in items:
                     # Используем dir как ID (т.к. ID не работает)
                     manga_dir = item.get("dir", "")
-                    results.append(MangaTitleInfo(
+                    title = item.get("rus_name") or item.get("en_name", "Unknown")
+                    
+                    # Вычисляем релевантность
+                    relevance = self._calculate_relevance(query, title)
+                    
+                    manga_info = MangaTitleInfo(
                         id=manga_dir,  # Используем dir вместо id
-                        title=item.get("rus_name") or item.get("en_name", "Unknown"),
+                        title=title,
                         cover_url=f"https://remanga.org{item.get('img', {}).get('high')}" if item.get("img", {}).get("high") else None,
                         description=None,  # В поиске нет описания
                         year=item.get("issue_year"),
                         status=item.get("status", {}).get("name") if isinstance(item.get("status"), dict) else None,
                         chapters_count=item.get("count_chapters", 0)
-                    ))
+                    )
+                    
+                    results_with_score.append((relevance, manga_info))
                 
-                logger.info(f"Found {len(results)} manga for query '{query}'")
-                return results
+                # Сортируем по релевантности (от большего к меньшему)
+                results_with_score.sort(key=lambda x: x[0], reverse=True)
+                
+                # Фильтруем результаты с очень низкой релевантностью (< 40)
+                filtered_results = [
+                    manga for score, manga in results_with_score 
+                    if score >= 40.0
+                ]
+                
+                # Если после фильтрации ничего не осталось, берем топ результаты
+                if not filtered_results and results_with_score:
+                    filtered_results = [manga for _, manga in results_with_score[:limit]]
+                else:
+                    filtered_results = filtered_results[:limit]
+                
+                logger.info(f"Found {len(filtered_results)} relevant manga for query '{query}'")
+                if results_with_score:
+                    logger.info(f"Top 3 scores: {[score for score, _ in results_with_score[:3]]}")
+                
+                return filtered_results
         except Exception as e:
             logger.error(f"Remanga search error: {type(e).__name__}: {e}", exc_info=True)
             return []
@@ -308,54 +378,93 @@ class RemangaParser:
             logger.error(f"Remanga get_chapter_pages error: {e}", exc_info=True)
             return []
     
-    async def download_image(self, url: str, retry_count: int = 2) -> bytes:
+    async def download_image(self, url: str, retry_count: int = 3) -> bytes:
         # Добавляем небольшую задержку для избежания блокировки
-        await asyncio.sleep(0.3)
+        await asyncio.sleep(0.5)
         
-        # Сначала пробуем обычный способ
         for attempt in range(retry_count):
             try:
+                # Сначала пробуем через aiohttp
                 session = await self._get_session()
                 
                 image_headers = {
                     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
                     "Referer": "https://remanga.org/",
-                    "Accept": "image/webp,image/apng,image/*,*/*;q=0.8",
+                    "Origin": "https://remanga.org",
+                    "Accept": "image/avif,image/webp,image/apng,image/svg+xml,image/*,*/*;q=0.8",
+                    "Accept-Language": "ru-RU,ru;q=0.9,en-US;q=0.8,en;q=0.7",
+                    "Accept-Encoding": "gzip, deflate, br",
+                    "Sec-Fetch-Dest": "image",
+                    "Sec-Fetch-Mode": "no-cors",
+                    "Sec-Fetch-Site": "cross-site",
+                    "sec-ch-ua": '"Not_A Brand";v="8", "Chromium";v="120", "Google Chrome";v="120"',
+                    "sec-ch-ua-mobile": "?0",
+                    "sec-ch-ua-platform": '"Windows"',
                 }
                 
                 async with session.get(url, headers=image_headers, allow_redirects=True) as response:
                     logger.info(f"Downloading image (attempt {attempt + 1}): {url}, status: {response.status}")
                     
+                    if response.status == 200:
+                        content = await response.read()
+                        logger.info(f"Downloaded {len(content)} bytes")
+                        return content
+                    
+                    # Если получили 403, пробуем через cloudscraper
                     if response.status == 403:
-                        # Cloudflare блокировка - используем FlareSolverr
-                        logger.warning(f"Got 403, switching to FlareSolverr...")
-                        return await self._download_with_flaresolverr(url)
+                        logger.warning(f"Got 403, switching to cloudscraper...")
+                        return await self._download_with_cloudscraper(url)
                     
-                    if response.status != 200:
-                        text = await response.text()
-                        logger.error(f"Failed to download image, status {response.status}: {text[:200]}")
-                        
-                        if attempt < retry_count - 1:
-                            await asyncio.sleep(2)
-                            continue
-                        
-                        raise Exception(f"Failed to download image from {url}, status: {response.status}")
+                    # Логируем ошибку
+                    text = await response.text()
+                    logger.error(f"Failed to download image, status {response.status}: {text[:200]}")
                     
-                    content = await response.read()
-                    logger.info(f"Downloaded {len(content)} bytes")
-                    return content
+                    if attempt < retry_count - 1:
+                        delay = 2 * (attempt + 1)
+                        logger.info(f"Retrying in {delay} seconds...")
+                        await asyncio.sleep(delay)
+                        continue
+                    
+                    raise Exception(f"Failed to download image from {url}, status: {response.status}")
+                    
             except Exception as e:
+                # Если это 403 или Cloudflare ошибка, пробуем cloudscraper
                 if "403" in str(e) or "Cloudflare" in str(e):
-                    # Пробуем FlareSolverr
-                    logger.warning(f"Switching to FlareSolverr due to: {e}")
+                    logger.warning(f"Switching to cloudscraper due to: {e}")
                     try:
-                        return await self._download_with_flaresolverr(url)
-                    except Exception as fs_error:
-                        logger.error(f"FlareSolverr also failed: {fs_error}")
-                        raise
+                        return await self._download_with_cloudscraper(url)
+                    except Exception as cs_error:
+                        logger.error(f"Cloudscraper also failed: {cs_error}")
+                        if attempt == retry_count - 1:
+                            raise
                 
                 if attempt == retry_count - 1:
                     logger.error(f"Remanga download_image error after {retry_count} attempts: {e}")
                     raise
-                logger.warning(f"Attempt {attempt + 1} failed: {e}, retrying...")
-                await asyncio.sleep(2)
+                
+                delay = 2 * (attempt + 1)
+                logger.warning(f"Attempt {attempt + 1} failed: {e}, retrying in {delay} seconds...")
+                await asyncio.sleep(delay)
+    
+    async def _download_with_cloudscraper(self, url: str) -> bytes:
+        """Скачивает изображение через cloudscraper для обхода Cloudflare"""
+        try:
+            logger.info(f"Using cloudscraper for: {url}")
+            
+            # Запускаем синхронный cloudscraper в отдельном потоке
+            def sync_download():
+                response = self.scraper.get(url, headers={
+                    "Referer": "https://remanga.org/",
+                    "Accept": "image/avif,image/webp,image/apng,image/svg+xml,image/*,*/*;q=0.8",
+                })
+                if response.status_code != 200:
+                    raise Exception(f"Cloudscraper failed with status {response.status_code}")
+                return response.content
+            
+            content = await asyncio.to_thread(sync_download)
+            logger.info(f"Cloudscraper downloaded {len(content)} bytes")
+            return content
+            
+        except Exception as e:
+            logger.error(f"Cloudscraper error: {e}")
+            raise

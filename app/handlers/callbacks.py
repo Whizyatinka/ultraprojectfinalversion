@@ -1,9 +1,11 @@
 import logging
+import os
 from aiogram import Router, F
 from aiogram.types import CallbackQuery, FSInputFile
 from aiogram.fsm.context import FSMContext
+from sqlalchemy import select
 
-from app.models.database import get_db
+from app.models.database import get_db, User, UserStats
 from app.keyboards.inline import get_manga_chapters_keyboard, get_manga_volumes_keyboard, get_volume_chapters_keyboard
 from app.services.manga_service import MangaService
 from app.utils.callback_manager import CallbackManager
@@ -17,7 +19,7 @@ router = Router()
 async def manga_chapters_callback(callback: CallbackQuery, state: FSMContext):
     manga_id = callback.data.split(":")[1]
     
-    async for db in get_db():
+    async with get_db() as db:
         service = MangaService(db)
         try:
             chapters = await service.get_chapters(manga_id)
@@ -45,7 +47,6 @@ async def manga_chapters_callback(callback: CallbackQuery, state: FSMContext):
             )
         finally:
             await service.close()
-        break
     
     await callback.answer()
 
@@ -56,7 +57,7 @@ async def manga_chapters_page_callback(callback: CallbackQuery, state: FSMContex
     manga_id = parts[1]
     page = int(parts[2]) if len(parts) > 2 else 0
     
-    async for db in get_db():
+    async with get_db() as db:
         service = MangaService(db)
         try:
             chapters = await service.get_chapters(manga_id)
@@ -82,7 +83,6 @@ async def manga_chapters_page_callback(callback: CallbackQuery, state: FSMContex
             )
         finally:
             await service.close()
-        break
     
     await callback.answer()
 
@@ -91,7 +91,7 @@ async def manga_chapters_page_callback(callback: CallbackQuery, state: FSMContex
 async def manga_volumes_callback(callback: CallbackQuery, state: FSMContext):
     manga_id = callback.data.split(":")[1]
     
-    async for db in get_db():
+    async with get_db() as db:
         service = MangaService(db)
         try:
             chapters = await service.get_chapters(manga_id)
@@ -136,7 +136,6 @@ async def manga_volumes_callback(callback: CallbackQuery, state: FSMContext):
             await callback.message.answer(text, reply_markup=keyboard)
         finally:
             await service.close()
-        break
     
     await callback.answer()
 
@@ -166,13 +165,12 @@ async def manga_volumes_page_callback(callback: CallbackQuery, state: FSMContext
         for vol_num, vol_chapters in sorted(volumes_dict.items())
     ]
     
-    async for db in get_db():
+    async with get_db() as db:
         keyboard = await get_manga_volumes_keyboard(
             volumes_data, manga_id, callback.from_user.id, db, page
         )
         
         await callback.message.edit_text(text, reply_markup=keyboard)
-        break
     
     await callback.answer()
 
@@ -181,7 +179,7 @@ async def manga_volumes_page_callback(callback: CallbackQuery, state: FSMContext
 async def manga_volume_chapters_callback(callback: CallbackQuery, state: FSMContext):
     short_id = callback.data.split(":")[1]
     
-    async for db in get_db():
+    async with get_db() as db:
         # Получаем данные из БД
         data = await CallbackManager.get_callback_data(db, short_id, callback.from_user.id)
         
@@ -215,7 +213,6 @@ async def manga_volume_chapters_callback(callback: CallbackQuery, state: FSMCont
             f"📖 Том {volume_num} ({len(volume_chapters)} глав):",
             reply_markup=keyboard
         )
-        break
     
     await callback.answer()
 
@@ -224,7 +221,7 @@ async def manga_volume_chapters_callback(callback: CallbackQuery, state: FSMCont
 async def manga_chapter_download_callback(callback: CallbackQuery, state: FSMContext):
     short_id = callback.data.split(":")[1]
     
-    async for db in get_db():
+    async with get_db() as db:
         # Получаем данные из БД
         data = await CallbackManager.get_callback_data(db, short_id, callback.from_user.id)
         
@@ -253,28 +250,59 @@ async def manga_chapter_download_callback(callback: CallbackQuery, state: FSMCon
                 await callback.answer()
                 return
             
-            await callback.message.answer("⏳ Скачиваю главу...")
+            # Отправляем начальное сообщение с прогрессом
+            progress_msg = await callback.message.answer(f"⏳ Скачиваю главу {chapter_num}...\n\n▱▱▱▱▱▱▱▱▱▱ 0%")
+            
+            # Функция для обновления прогресса
+            async def update_progress(current: int, total: int, status: str):
+                try:
+                    if status == "downloading":
+                        percent = int((current / total) * 100)
+                        filled = int((current / total) * 10)
+                        bar = "▰" * filled + "▱" * (10 - filled)
+                        text = f"⏳ Скачиваю главу {chapter_num}...\n\n{bar} {percent}%\nСтраница {current}/{total}"
+                        await progress_msg.edit_text(text)
+                    elif status == "creating_pdf":
+                        await progress_msg.edit_text(f"📄 Создаю PDF для главы {chapter_num}...")
+                except Exception as e:
+                    logger.error(f"Failed to update progress: {e}")
             
             filepath, is_cached = await service.download_chapter(
-                chapter_id, manga_id, manga.title, chapter_num, callback.from_user.id
+                chapter_id, manga_id, manga.title, chapter_num, callback.from_user.id, progress_callback=update_progress
             )
             
             if filepath:
-                # Используем FSInputFile для отправки файла
-                document = FSInputFile(filepath)
-                await callback.message.answer_document(
-                    document,
-                    caption=f"📄 {manga.title} - Глава {chapter_num}"
-                )
+                # Удаляем сообщение с прогрессом
+                try:
+                    await progress_msg.delete()
+                except:
+                    pass
                 
-                await service.update_user_stats(callback.from_user.id, 1)
+                # Проверяем размер файла
+                file_size = os.path.getsize(filepath)
+                file_size_mb = file_size / (1024 * 1024)
+                
+                if file_size > 50 * 1024 * 1024:
+                    await callback.message.answer(
+                        f"⚠️ Файл слишком большой ({file_size_mb:.1f} МБ). "
+                        f"Telegram поддерживает файлы до 50 МБ.\n"
+                        f"Попробуйте скачать главу с меньшим количеством страниц."
+                    )
+                else:
+                    # Используем FSInputFile для отправки файла
+                    document = FSInputFile(filepath)
+                    await callback.message.answer_document(
+                        document,
+                        caption=f"📄 {manga.title} - Глава {chapter_num} ({file_size_mb:.1f} МБ)"
+                    )
+                    
+                    await service.update_user_stats(callback.from_user.id, 1)
             
         except Exception as e:
             logger.error(f"Download error: {e}")
             await callback.message.answer(f"❌ Ошибка при скачивании: {str(e)}")
         finally:
             await service.close()
-        break
     
     await callback.answer()
 
@@ -283,7 +311,7 @@ async def manga_chapter_download_callback(callback: CallbackQuery, state: FSMCon
 async def manga_volume_download_callback(callback: CallbackQuery, state: FSMContext):
     short_id = callback.data.split(":")[1]
     
-    async for db in get_db():
+    async with get_db() as db:
         # Получаем данные из БД
         data = await CallbackManager.get_callback_data(db, short_id, callback.from_user.id)
         
@@ -312,10 +340,21 @@ async def manga_volume_download_callback(callback: CallbackQuery, state: FSMCont
                     filepath, _ = await service.download_chapter(
                         ch.get("id"), manga.title, ch.get("number")
                     )
+                    
+                    # Проверяем размер файла
+                    file_size = os.path.getsize(filepath)
+                    file_size_mb = file_size / (1024 * 1024)
+                    
+                    if file_size > 50 * 1024 * 1024:
+                        await callback.message.answer(
+                            f"⚠️ Глава {ch.get('number')} слишком большая ({file_size_mb:.1f} МБ), пропускаю..."
+                        )
+                        continue
+                    
                     document = FSInputFile(filepath)
                     await callback.message.answer_document(
                         document,
-                        caption=f"📄 {manga.title} - Том {volume_num}, Глава {ch.get('number')}"
+                        caption=f"📄 {manga.title} - Том {volume_num}, Глава {ch.get('number')} ({file_size_mb:.1f} МБ)"
                     )
                     downloaded += 1
                 except Exception as e:
@@ -329,7 +368,6 @@ async def manga_volume_download_callback(callback: CallbackQuery, state: FSMCont
             await callback.message.answer(f"❌ Ошибка при скачивании: {str(e)}")
         finally:
             await service.close()
-        break
     
     await callback.answer()
 
@@ -338,7 +376,7 @@ async def manga_volume_download_callback(callback: CallbackQuery, state: FSMCont
 async def manga_download_all_callback(callback: CallbackQuery):
     manga_id = callback.data.split(":")[1]
     
-    async for db in get_db():
+    async with get_db() as db:
         service = MangaService(db)
         try:
             manga = await service.get_title_details(manga_id)
@@ -351,7 +389,7 @@ async def manga_download_all_callback(callback: CallbackQuery):
                 "Это может занять некоторое время."
             )
             
-            paths = await service.download_all_chapters(manga_id, callback.from_user.id)
+            paths = await service.download_all_chapters(manga_id, manga.title, callback.from_user.id)
             
             if paths:
                 await callback.message.answer(f"✅ Скачано {len(paths)} глав!")
@@ -364,7 +402,6 @@ async def manga_download_all_callback(callback: CallbackQuery):
             await callback.message.answer(f"❌ Ошибка: {str(e)}")
         finally:
             await service.close()
-        break
     
     await callback.answer()
 
@@ -373,10 +410,7 @@ async def manga_download_all_callback(callback: CallbackQuery):
 async def stats_callback(callback: CallbackQuery):
     tg_id = callback.from_user.id
     
-    async for db in get_db():
-        from sqlalchemy import select
-        from app.models.database import User, UserStats
-        
+    async with get_db() as db:
         result = await db.execute(select(User).where(User.tg_id == tg_id))
         user = result.scalar_one_or_none()
         
@@ -388,7 +422,6 @@ async def stats_callback(callback: CallbackQuery):
                 f"📊 <b>Ваша статистика:</b>\n\n"
                 f"📚 <b>Манга:</b> {stats.manga_chapters_count if stats else 0} глав"
             )
-        break
     
     await callback.answer()
 

@@ -132,14 +132,14 @@ async def get_volume_chapters_keyboard(chapters: list, manga_id: str, volume_num
     return builder.as_markup()
 
 
-def get_search_keyboard(results: list, prefix: str) -> InlineKeyboardMarkup:
+def get_search_keyboard(results: list) -> InlineKeyboardMarkup:
     builder = InlineKeyboardBuilder()
-    
-    for i, item in enumerate(results[:10]):
+
+    for item in results[:10]:
         text = item.get("title", "Unknown")[:50]
         callback = f"manga_card:{item.get('id')}"
         builder.button(text=text, callback_data=callback)
-    
-    builder.button(text="🔄 Новый поиск", callback_data=f"{prefix}_search")
+
+    builder.button(text="🔄 Новый поиск", callback_data="manga_search")
     builder.adjust(1)
     return builder.as_markup()

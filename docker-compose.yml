@@ -5,21 +5,6 @@ services:
     build: .
     env_file:
       - .env
-    depends_on:
-      - postgres
     volumes:
       - ./downloads:/app/downloads
-
-  postgres:
-    image: postgres:15-alpine
-    environment:
-      POSTGRES_USER: ${POSTGRES_USER:-bot_user}
-      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-bot_password}
-      POSTGRES_DB: ${POSTGRES_DB:-telegram_bot}
-    volumes:
-      - postgres_data:/var/lib/postgresql/data
-    ports:
-      - "5432:5432"
-
-volumes:
-  postgres_data:
+      - ./telegram_bot.db:/app/telegram_bot.db
