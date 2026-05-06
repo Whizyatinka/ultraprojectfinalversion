@@ -47,7 +47,7 @@ async def manga_chapters_callback(callback: CallbackQuery, state: FSMContext):
             )
         finally:
             await service.close()
-    
+
     await callback.answer()
 
 
@@ -83,7 +83,7 @@ async def manga_chapters_page_callback(callback: CallbackQuery, state: FSMContex
             )
         finally:
             await service.close()
-    
+
     await callback.answer()
 
 
@@ -136,6 +136,7 @@ async def manga_volumes_callback(callback: CallbackQuery, state: FSMContext):
             await callback.message.answer(text, reply_markup=keyboard)
         finally:
             await service.close()
+        break
     
     await callback.answer()
 
@@ -171,7 +172,7 @@ async def manga_volumes_page_callback(callback: CallbackQuery, state: FSMContext
         )
         
         await callback.message.edit_text(text, reply_markup=keyboard)
-    
+
     await callback.answer()
 
 
@@ -213,7 +214,7 @@ async def manga_volume_chapters_callback(callback: CallbackQuery, state: FSMCont
             f"📖 Том {volume_num} ({len(volume_chapters)} глав):",
             reply_markup=keyboard
         )
-    
+
     await callback.answer()
 
 
@@ -303,7 +304,7 @@ async def manga_chapter_download_callback(callback: CallbackQuery, state: FSMCon
             await callback.message.answer(f"❌ Ошибка при скачивании: {str(e)}")
         finally:
             await service.close()
-    
+
     await callback.answer()
 
 
@@ -368,7 +369,7 @@ async def manga_volume_download_callback(callback: CallbackQuery, state: FSMCont
             await callback.message.answer(f"❌ Ошибка при скачивании: {str(e)}")
         finally:
             await service.close()
-    
+
     await callback.answer()
 
 
@@ -402,7 +403,7 @@ async def manga_download_all_callback(callback: CallbackQuery):
             await callback.message.answer(f"❌ Ошибка: {str(e)}")
         finally:
             await service.close()
-    
+
     await callback.answer()
 
 
